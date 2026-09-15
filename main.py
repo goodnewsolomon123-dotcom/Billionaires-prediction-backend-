@@ -40,6 +40,17 @@ def grant_vip(uid: str, plan_id: str, days: int):
     return expires_at
 
 
+def log_transaction(uid: str, tx_type: str, amount_kobo: int, meta: dict, status: str = "success"):
+    db.collection("bpp_transactions").add({
+        "uid": uid,
+        "type": tx_type,
+        "amount": amount_kobo / 100,  # store in naira for easy display
+        "status": status,
+        "meta": meta,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+    })
+
+
 def mark_reference_used(reference: str, uid: str, source: str):
     db.collection("used_references").document(reference).set(
         {"uid": uid, "verifiedAt": firestore.SERVER_TIMESTAMP, "source": source}
@@ -92,6 +103,7 @@ async def verify_payment(request: Request, authorization: str = Header(None)):
 
     mark_reference_used(reference, uid, "verify_endpoint")
     expires_at = grant_vip(uid, plan_id, int(days))
+    log_transaction(uid, "subscription", result["data"]["amount"], {"planId": plan_id, "reference": reference})
 
     return {"success": True, "vipExpiresAt": expires_at.isoformat()}
 
@@ -121,6 +133,7 @@ async def paystack_webhook(request: Request, x_paystack_signature: str = Header(
         if uid and plan_id and days and not is_reference_used(reference):
             mark_reference_used(reference, uid, "webhook")
             grant_vip(uid, plan_id, int(days))
+            log_transaction(uid, "subscription", data["amount"], {"planId": plan_id, "reference": reference})
 
     # Always return 200 quickly so Paystack doesn't keep retrying
     return {"received": True}
