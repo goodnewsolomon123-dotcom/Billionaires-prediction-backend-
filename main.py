@@ -116,30 +116,81 @@ async def webhook(request: Request, x_paystack_signature: str = Header(None)):
     return {"received": True}
 
 
+ADMIN_EMAILS = set(e.strip().lower() for e in os.environ.get(
+    "ADMIN_EMAILS", "engroscar516@gmail.com,uzodinmachuks677@gmail.com").split(","))
+
+
+def has_access(tok):
+    if (tok.get("email") or "").lower() in ADMIN_EMAILS and tok.get("email_verified"):
+        return True
+    uid = tok["uid"]
+    u = db.collection("acad_users").document(uid).get().to_dict() or {}
+    if u.get("status") != "verified":
+        return False
+    pu = (db.collection("acad_enroll").document(uid).get().to_dict() or {}).get("paidUntil")
+    return bool(pu and pu > datetime.now(timezone.utc))
+
+
 @app.post("/ai/tutor")
 def ai_tutor(body: dict, authorization: str = Header(None)):
+    import re
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Please log in again")
     try:
-        fa.verify_id_token(authorization.split(" ", 1)[1])
+        tok = fa.verify_id_token(authorization.split(" ", 1)[1])
     except Exception:
         raise HTTPException(401, "Please log in again")
     if not GROQ_KEY:
         raise HTTPException(503, "AI tutor is not configured yet (missing GROQ_API_KEY)")
+    if not has_access(tok):
+        raise HTTPException(403, "Your class opens after you pay and the academy approves your account.")
+    uid = tok["uid"]
     course = str(body.get("course") or "this course")[:80]
-    msgs = [{"role": m["role"], "content": str(m.get("content", ""))[:2000]}
-            for m in (body.get("messages") or [])[-12:]
+    act = body.get("action") if body.get("action") in ("start", "next") else "chat"
+    hist = [{"role": m["role"], "content": str(m.get("content", ""))[:2500]}
+            for m in (body.get("messages") or [])[-10:]
             if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
-    if not msgs or msgs[-1]["role"] != "user":
-        raise HTTPException(400, "Ask a question first")
-    system = (f"You are a friendly AI tutor at Oscar Daxton Academy for the course: {course}. "
-              "Explain step by step in simple English with short examples. Stay on this course; "
-              "politely redirect unrelated questions. Keep answers clear and not too long.")
+    key = re.sub(r"[^A-Za-z0-9]+", "_", course)
+    pr = db.collection("acad_progress").document(uid)
+    n = int((pr.get().to_dict() or {}).get(key, 0) or 0)
+    if act == "next":
+        n = max(n, 1) + 1
+    elif act == "start":
+        n = max(n, 1)
+    if act != "chat":
+        pr.set({key: n}, merge=True)
+    lessons = sorted([d.to_dict() for d in db.collection("acad_items").where("to", "==", course).stream()
+                      if (d.to_dict() or {}).get("type") == "lesson"],
+                     key=lambda x: x.get("createdAt") or datetime.min.replace(tzinfo=timezone.utc))
+    mat = ""
+    if 1 <= n <= len(lessons):
+        L = lessons[n - 1]
+        mat = (f"\nThe academy's own material for this lesson (teach from it, and add to it where it is thin):\n"
+               f"Title: {L.get('title', '')}\n{str(L.get('body', ''))[:3500]}")
+    system = (f"You are the class teacher at Oscar Daxton Academy for the course: {course}. The student has paid and "
+              "is enrolled, so you teach the course lesson by lesson, from beginner level upward, in a logical order "
+              "that suits this practical course. Write in plain text only: no markdown symbols (no #, *, or backticks). "
+              "Use clear short paragraphs, numbered steps, and put commands or code on their own indented lines. "
+              "Simple English, friendly and encouraging, with real-life examples. Stay on this course; politely "
+              f"redirect anything unrelated. The student is on lesson {n}.{mat}")
+    if act == "chat":
+        if not hist or hist[-1]["role"] != "user":
+            raise HTTPException(400, "Ask a question first")
+        msgs, mx = hist, 800
+        system += (" Answer the student's question or mark their answers to your check questions: say what is right, "
+                   "correct mistakes gently, and when they seem ready tell them to tap Next lesson.")
+    else:
+        msgs = hist[-6:] + [{"role": "user", "content": (
+            f"Teach lesson {n} of the {course} course now. Use this structure: 1) Lesson title and what I will be able "
+            "to do after it. 2) The explanation with a real example. 3) A hands-on practice I can do step by step. "
+            "4) Three short check questions for me to answer, then stop and wait for my answers.")}]
+        mx = 1500
+
     def call(model):
         return requests.post("https://api.groq.com/openai/v1/chat/completions",
                              headers={"Authorization": f"Bearer {GROQ_KEY}"},
                              json={"model": model, "messages": [{"role": "system", "content": system}] + msgs,
-                                   "temperature": 0.5, "max_tokens": 700}, timeout=30)
+                                   "temperature": 0.5, "max_tokens": mx}, timeout=45)
     try:
         r = call(pick_model())
         if r.status_code in (400, 403, 404) and "model" in r.text.lower():
@@ -149,7 +200,7 @@ def ai_tutor(body: dict, authorization: str = Header(None)):
         raise HTTPException(502, "The AI tutor could not be reached. Try again.")
     if r.status_code != 200:
         raise HTTPException(502, "AI tutor error: " + str((data.get("error") or {}).get("message", r.status_code))[:200])
-    return {"reply": data["choices"][0]["message"]["content"]}
+    return {"reply": data["choices"][0]["message"]["content"], "lesson": n}
 
 
 @app.get("/")
