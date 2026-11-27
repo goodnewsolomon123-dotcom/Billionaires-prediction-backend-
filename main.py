@@ -12,7 +12,26 @@ firebase_admin.initialize_app(credentials.Certificate(json.loads(os.environ["FIR
 db = firestore.client()
 SK = os.environ["PAYSTACK_SECRET_KEY"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "")
+_PREF = ["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"]
+_SKIP = ("whisper", "guard", "tts", "playai", "orpheus", "distil", "compound", "safeguard", "embed")
+_mc = {"t": 0.0, "m": None}
+
+
+def pick_model(force=False):
+    import time
+    if not force and _mc["m"] and time.time() - _mc["t"] < 600:
+        return _mc["m"]
+    ids = []
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {GROQ_KEY}"}, timeout=15)
+        ids = [m["id"] for m in r.json().get("data", []) if m.get("active", True)]
+    except Exception:
+        pass
+    chat = [i for i in ids if not any(k in i.lower() for k in _SKIP)]
+    pick = next((m for m in ([GROQ_MODEL] if GROQ_MODEL else []) + _PREF if m in ids), None) or (chat[0] if chat else (GROQ_MODEL or _PREF[0]))
+    _mc.update(t=time.time(), m=pick)
+    return pick
 
 
 def record(ref, uid, fee_id, paid_kobo):
@@ -116,11 +135,15 @@ def ai_tutor(body: dict, authorization: str = Header(None)):
     system = (f"You are a friendly AI tutor at Oscar Daxton Academy for the course: {course}. "
               "Explain step by step in simple English with short examples. Stay on this course; "
               "politely redirect unrelated questions. Keep answers clear and not too long.")
+    def call(model):
+        return requests.post("https://api.groq.com/openai/v1/chat/completions",
+                             headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                             json={"model": model, "messages": [{"role": "system", "content": system}] + msgs,
+                                   "temperature": 0.5, "max_tokens": 700}, timeout=30)
     try:
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-                          headers={"Authorization": f"Bearer {GROQ_KEY}"},
-                          json={"model": GROQ_MODEL, "messages": [{"role": "system", "content": system}] + msgs,
-                                "temperature": 0.5, "max_tokens": 700}, timeout=30)
+        r = call(pick_model())
+        if r.status_code in (400, 403, 404) and "model" in r.text.lower():
+            r = call(pick_model(force=True))
         data = r.json()
     except Exception:
         raise HTTPException(502, "The AI tutor could not be reached. Try again.")
