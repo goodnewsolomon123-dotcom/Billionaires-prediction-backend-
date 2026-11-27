@@ -11,6 +11,8 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 firebase_admin.initialize_app(credentials.Certificate(json.loads(os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"])))
 db = firestore.client()
 SK = os.environ["PAYSTACK_SECRET_KEY"]
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 def record(ref, uid, fee_id, paid_kobo):
@@ -93,6 +95,38 @@ async def webhook(request: Request, x_paystack_signature: str = Header(None)):
         except HTTPException:
             pass
     return {"received": True}
+
+
+@app.post("/ai/tutor")
+def ai_tutor(body: dict, authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Please log in again")
+    try:
+        fa.verify_id_token(authorization.split(" ", 1)[1])
+    except Exception:
+        raise HTTPException(401, "Please log in again")
+    if not GROQ_KEY:
+        raise HTTPException(503, "AI tutor is not configured yet (missing GROQ_API_KEY)")
+    course = str(body.get("course") or "this course")[:80]
+    msgs = [{"role": m["role"], "content": str(m.get("content", ""))[:2000]}
+            for m in (body.get("messages") or [])[-12:]
+            if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+    if not msgs or msgs[-1]["role"] != "user":
+        raise HTTPException(400, "Ask a question first")
+    system = (f"You are a friendly AI tutor at Oscar Daxton Academy for the course: {course}. "
+              "Explain step by step in simple English with short examples. Stay on this course; "
+              "politely redirect unrelated questions. Keep answers clear and not too long.")
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                          headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                          json={"model": GROQ_MODEL, "messages": [{"role": "system", "content": system}] + msgs,
+                                "temperature": 0.5, "max_tokens": 700}, timeout=30)
+        data = r.json()
+    except Exception:
+        raise HTTPException(502, "The AI tutor could not be reached. Try again.")
+    if r.status_code != 200:
+        raise HTTPException(502, "AI tutor error: " + str((data.get("error") or {}).get("message", r.status_code))[:200])
+    return {"reply": data["choices"][0]["message"]["content"]}
 
 
 @app.get("/")
